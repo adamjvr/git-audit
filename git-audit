@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+from datetime import datetime
+
+
+SKIP_DIRS = {
+    ".cache",
+    "node_modules",
+    "build",
+    "target",
+    ".venv",
+    "venv",
+}
+
+
+def run_git(repo, *args, timeout=15):
+    """Run a git command and return (success, stdout, stderr)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+        return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, "", str(exc)
+
+
+def discover_repos(root):
+    """Find Git repositories beneath root without descending into repos."""
+    repos = []
+
+    def walk(path):
+        try:
+            children = list(path.iterdir())
+        except (PermissionError, OSError):
+            return
+
+        if (path / ".git").exists():
+            repos.append(path)
+            return
+
+        for child in children:
+            if child.is_dir() and child.name not in SKIP_DIRS:
+                walk(child)
+
+    walk(root)
+    return sorted(repos, key=lambda p: str(p).lower())
+
+
+def count_porcelain(status_text):
+    staged = 0
+    modified = 0
+    untracked = 0
+    conflicts = 0
+
+    conflict_codes = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
+
+    for line in status_text.splitlines():
+        if not line:
+            continue
+
+        code = line[:2]
+
+        if code == "??":
+            untracked += 1
+            continue
+
+        if code in conflict_codes:
+            conflicts += 1
+
+        x, y = code[0], code[1]
+
+        if x not in (" ", "?"):
+            staged += 1
+        if y not in (" ", "?"):
+            modified += 1
+
+    return staged, modified, untracked, conflicts
+
+
+def repo_info(repo, fetch=False):
+    fetch_error = ""
+
+    if fetch:
+        ok, _, fetch_error = run_git(
+            repo, "fetch", "--all", "--prune", "--quiet", timeout=60
+        )
+        if ok:
+            fetch_error = ""
+
+    _, branch, _ = run_git(repo, "branch", "--show-current")
+    detached = not branch
+
+    if detached:
+        ok, sha, _ = run_git(repo, "rev-parse", "--short", "HEAD")
+        branch = f"DETACHED@{sha}" if ok else "DETACHED"
+
+    _, status, _ = run_git(repo, "status", "--porcelain")
+    staged, modified, untracked, conflicts = count_porcelain(status)
+
+    ok, upstream, _ = run_git(
+        repo,
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    )
+    if not ok:
+        upstream = ""
+
+    ahead = None
+    behind = None
+
+    if upstream:
+        ok, counts, _ = run_git(
+            repo,
+            "rev-list",
+            "--left-right",
+            "--count",
+            f"{upstream}...HEAD",
+        )
+        if ok:
+            parts = counts.split()
+            if len(parts) == 2:
+                behind = int(parts[0])
+                ahead = int(parts[1])
+
+    ok, remotes, _ = run_git(repo, "remote")
+    remote_list = remotes.splitlines() if ok and remotes else []
+
+    ok, origin_url, _ = run_git(repo, "remote", "get-url", "origin")
+    if not ok:
+        origin_url = ""
+
+    ok, stash_text, _ = run_git(repo, "stash", "list")
+    stash_count = len(stash_text.splitlines()) if ok and stash_text else 0
+
+    ok, latest, _ = run_git(
+        repo,
+        "log",
+        "-1",
+        "--date=iso-local",
+        "--pretty=format:%h|%ad|%s",
+    )
+
+    commit_hash = "-"
+    commit_date = "-"
+    commit_subject = "No commits"
+
+    if ok and latest:
+        parts = latest.split("|", 2)
+        if len(parts) == 3:
+            commit_hash, commit_date, commit_subject = parts
+
+    problems = []
+
+    if fetch_error:
+        problems.append("FETCH FAILED")
+    if conflicts:
+        problems.append("CONFLICTS")
+    if modified or staged or untracked:
+        problems.append("NEEDS COMMIT")
+    if not remote_list:
+        problems.append("NO REMOTE")
+    if remote_list and not upstream:
+        problems.append("NO UPSTREAM")
+    if ahead and ahead > 0:
+        problems.append("NEEDS PUSH")
+    if behind and behind > 0:
+        problems.append("BEHIND")
+    if detached:
+        problems.append("DETACHED")
+    if stash_count:
+        problems.append("STASHED WORK")
+
+    overall = "SAFE" if not problems else " + ".join(problems)
+
+    return {
+        "name": repo.name,
+        "path": str(repo),
+        "branch": branch,
+        "upstream": upstream or "-",
+        "ahead": ahead,
+        "behind": behind,
+        "staged": staged,
+        "modified": modified,
+        "untracked": untracked,
+        "conflicts": conflicts,
+        "stashes": stash_count,
+        "remote_count": len(remote_list),
+        "origin": origin_url,
+        "commit_hash": commit_hash,
+        "commit_date": commit_date,
+        "commit_subject": commit_subject,
+        "overall": overall,
+        "fetch_error": fetch_error,
+    }
+
+
+def compact_changes(info):
+    bits = []
+    if info["staged"]:
+        bits.append(f"S:{info['staged']}")
+    if info["modified"]:
+        bits.append(f"M:{info['modified']}")
+    if info["untracked"]:
+        bits.append(f"?:{info['untracked']}")
+    if info["conflicts"]:
+        bits.append(f"C:{info['conflicts']}")
+    if info["stashes"]:
+        bits.append(f"stash:{info['stashes']}")
+    return " ".join(bits) if bits else "clean"
+
+
+def compact_sync(info):
+    if info["remote_count"] == 0:
+        return "NO REMOTE"
+    if info["upstream"] == "-":
+        return "NO UPSTREAM"
+
+    ahead = info["ahead"] if info["ahead"] is not None else "?"
+    behind = info["behind"] if info["behind"] is not None else "?"
+
+    if ahead == 0 and behind == 0:
+        return "synced"
+    return f"+{ahead}/-{behind}"
+
+
+def print_report(results, root):
+    print()
+    print("=" * 100)
+    print("GIT REPOSITORY AUDIT")
+    print("=" * 100)
+    print(f"Root:         {root}")
+    print(f"Repositories: {len(results)}")
+    print(f"Generated:    {datetime.now().astimezone().isoformat(timespec='seconds')}")
+    print()
+
+    safe = sum(1 for r in results if r["overall"] == "SAFE")
+    dirty = sum(1 for r in results if r["staged"] or r["modified"] or r["untracked"])
+    unpushed = sum(1 for r in results if r["ahead"] is not None and r["ahead"] > 0)
+    behind = sum(1 for r in results if r["behind"] is not None and r["behind"] > 0)
+    no_remote = sum(1 for r in results if r["remote_count"] == 0)
+    no_upstream = sum(
+        1 for r in results if r["remote_count"] > 0 and r["upstream"] == "-"
+    )
+    stash_repos = sum(1 for r in results if r["stashes"] > 0)
+    fetch_failed = sum(1 for r in results if r["fetch_error"])
+
+    print("SUMMARY")
+    print(f"  SAFE:               {safe}")
+    print(f"  Working tree dirty: {dirty}")
+    print(f"  Unpushed commits:   {unpushed}")
+    print(f"  Behind upstream:    {behind}")
+    print(f"  No remote:          {no_remote}")
+    print(f"  No upstream:        {no_upstream}")
+    print(f"  Repos with stashes: {stash_repos}")
+    print(f"  Fetch failures:     {fetch_failed}")
+    print()
+
+    print("-" * 100)
+
+    for info in results:
+        print(info["name"])
+        print(f"  Status:   {info['overall']}")
+        print(f"  Branch:   {info['branch']}")
+        print(f"  Changes:  {compact_changes(info)}")
+        print(f"  Remote:   {compact_sync(info)}")
+
+        if info["upstream"] != "-":
+            print(f"  Tracking: {info['upstream']}")
+
+        print(
+            f"  Latest:   {info['commit_hash']}  "
+            f"{info['commit_date']}  {info['commit_subject']}"
+        )
+
+        if info["origin"]:
+            print(f"  Origin:   {info['origin']}")
+        if info["fetch_error"]:
+            print(f"  Fetch:    FAILED: {info['fetch_error']}")
+
+        print(f"  Path:     {info['path']}")
+        print("-" * 100)
+
+    print()
+    print("ATTENTION REQUIRED")
+    print()
+
+    trouble = [r for r in results if r["overall"] != "SAFE"]
+
+    if not trouble:
+        print("  All repositories appear committed and synchronized.")
+    else:
+        for info in trouble:
+            print(f"  {info['name']:<32} {info['overall']}")
+
+    print()
+
+
+def write_markdown(results, root, output):
+    lines = [
+        "# Git Repository Audit",
+        "",
+        f"Generated: `{datetime.now().astimezone().isoformat(timespec='seconds')}`",
+        "",
+        f"Root: `{root}`",
+        "",
+        "| Repository | State | Branch | Changes | Remote | Latest commit |",
+        "|---|---|---|---|---|---|",
+    ]
+
+    for info in results:
+        subject = info["commit_subject"].replace("|", "\\|")
+        lines.append(
+            f"| {info['name']} "
+            f"| {info['overall']} "
+            f"| `{info['branch']}` "
+            f"| {compact_changes(info)} "
+            f"| {compact_sync(info)} "
+            f"| `{info['commit_hash']}` {subject} |"
+        )
+
+    lines.extend(["", "## Attention Required", ""])
+
+    trouble = [r for r in results if r["overall"] != "SAFE"]
+
+    if trouble:
+        for info in trouble:
+            lines.append(
+                f"- **{info['name']}** — {info['overall']} — `{info['path']}`"
+            )
+    else:
+        lines.append("All repositories appear committed and synchronized.")
+
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Audit a folder containing Git repositories."
+    )
+    parser.add_argument(
+        "root",
+        nargs="?",
+        default="~/GitHub",
+        help="Directory containing repositories (default: ~/GitHub)",
+    )
+    parser.add_argument(
+        "--fetch",
+        action="store_true",
+        help="Run git fetch --all --prune before checking each repo.",
+    )
+    parser.add_argument(
+        "--markdown",
+        metavar="FILE",
+        help="Also write a Markdown report.",
+    )
+
+    args = parser.parse_args()
+
+    root = Path(args.root).expanduser().resolve()
+
+    if not root.exists():
+        print(f"ERROR: directory does not exist: {root}", file=sys.stderr)
+        return 2
+
+    repos = discover_repos(root)
+
+    if not repos:
+        print(f"No Git repositories found under {root}")
+        return 0
+
+    results = []
+    for repo in repos:
+        print(f"Checking {repo.name}...", file=sys.stderr)
+        results.append(repo_info(repo, fetch=args.fetch))
+
+    print_report(results, root)
+
+    if args.markdown:
+        output = Path(args.markdown).expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_markdown(results, root, output)
+        print(f"Markdown report written to: {output}")
+
+    return 1 if any(r["overall"] != "SAFE" for r in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
