@@ -1,63 +1,72 @@
 # git-audit
 
-Read-only audit tool for checking the backup/commit state of a directory full of Git repositories.
+`git-audit` is a deliberately hands-off auditor for directories containing many local Git repositories.
 
-## What it checks
+Its purpose is simple: show you what is sitting on disk so **you** can decide what, if anything, needs attention.
 
-For every repository it finds:
+## Safety contract
 
-- working tree cleanliness
+`git-audit` is diagnostic only.
+
+It does **not** fetch, push, pull, commit, checkout, switch branches, stash, reset, merge, rebase, change remotes, contact GitHub, or automatically repair repositories.
+
+All Git subprocesses are run non-interactively.
+
+See [`docs/SAFETY.md`](docs/SAFETY.md) for the full safety model.
+
+## What it reports
+
+For each repository, `git-audit` reports:
+
+- clean vs. uncommitted working tree
 - staged files
 - modified files
 - untracked files
-- merge conflicts
+- unresolved conflicts
+- current branch
+- detached HEAD state
 - configured remotes
 - configured upstream branch
-- local commits ahead of upstream
-- local branch behind upstream
-- detached HEAD state
+- local comparison with the **cached** upstream reference
 - Git stashes
-- latest commit
-- optional remote refresh with `git fetch --all --prune`
+- latest local commit
+- local repository path
 
-The tool **does not commit, push, pull, checkout, stash, reset, or modify repositories**.
+Because the tool never fetches, an upstream comparison is intentionally limited to whatever remote-tracking reference already exists locally. It does **not** claim to know the current state of GitHub.
+
+## Requirements
+
+- Python 3
+- Git
+
+No Python packages are required.
 
 ## Usage
-
-Audit `~/GitHub` using locally cached remote state:
 
 ```bash
 ./git-audit ~/GitHub
 ```
 
-Refresh remotes first:
-
-```bash
-./git-audit ~/GitHub --fetch
-```
-
-Create a Markdown report:
+Generate a Markdown report:
 
 ```bash
 ./git-audit ~/GitHub \
-  --fetch \
   --markdown ~/Downloads/github-repo-audit.md
 ```
 
-## Status meanings
+Repository findings are informational and do not cause a non-zero exit code.
 
-- `SAFE` — clean working tree and synchronized configured upstream
-- `NEEDS COMMIT` — staged, modified, or untracked files exist
-- `NEEDS PUSH` — local commits have not reached the configured upstream
-- `BEHIND` — upstream has commits not present locally
-- `NO REMOTE` — repository has no configured remote
-- `NO UPSTREAM` — current branch does not track a remote branch
-- `STASHED WORK` — one or more Git stashes exist
-- `DETACHED` — repository is in detached HEAD state
-- `FETCH FAILED` — remote refresh failed
-- `CONFLICTS` — unresolved merge conflicts exist
+## Example interpretation
 
-Multiple conditions may be shown together.
+```text
+State:     UNCOMMITTED WORK + LOCAL COMMITS NOT IN CACHED UPSTREAM
+Changes:   modified:2, untracked:1
+Upstream:  local +3 / cached upstream +0
+```
+
+This means local files have uncommitted changes and local `HEAD` is three commits ahead of the machine's cached upstream ref. **No network verification was performed.**
+
+See [`docs/STATUS_REFERENCE.md`](docs/STATUS_REFERENCE.md) for status meanings.
 
 ## Validation
 
@@ -65,6 +74,26 @@ Multiple conditions may be shown together.
 ./scripts/build_test.sh
 ```
 
-Validation evidence is emitted as one timestamped ZIP in `~/Downloads`.
+Validation evidence is written as one timestamped archive:
 
-`scripts/check.sh` is retained as a compatibility wrapper.
+```text
+~/Downloads/git-audit-BuildTest-YYYYMMDD-HHMMSS.zip
+```
+
+No loose validation logs are left behind.
+
+`scripts/check.sh` remains a compatibility wrapper.
+
+## Project philosophy
+
+This project intentionally favors **observation over automation**.
+
+Its job is:
+
+> Tell me what is here. Touch nothing.
+
+## Version
+
+Current documented behavior: **v0.1.1 — Local-only diagnostic mode**
+
+See [`CHANGELOG.md`](CHANGELOG.md).

@@ -5,13 +5,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="${HOME}/Downloads/git-audit-BuildTest-${STAMP}"
 ZIP="${OUT}.zip"
+PASS=1
 
 mkdir -p "$OUT"
 
-PASS=1
-
 {
-  echo "git-audit validation"
+  echo "git-audit local-only validation"
   echo "timestamp: $(date --iso-8601=seconds)"
   echo "repo: $ROOT"
   echo
@@ -34,7 +33,24 @@ PASS=1
   fi
 
   echo
-  echo "== Self audit smoke test =="
+  echo "== Verify forbidden network/mutation options are absent =="
+  HELP="$("$ROOT/git-audit" --help 2>&1)"
+  FORBIDDEN=0
+  for word in fetch push pull commit checkout stash reset fix; do
+    if printf '%s\n' "$HELP" | grep -Eq -- "--${word}([[:space:]=]|$)"; then
+      echo "FAIL: unexpected option --$word"
+      FORBIDDEN=1
+    fi
+  done
+
+  if [[ "$FORBIDDEN" -eq 0 ]]; then
+    echo "PASS"
+  else
+    PASS=0
+  fi
+
+  echo
+  echo "== Local state smoke test =="
   TMP="$(mktemp -d)"
   mkdir -p "$TMP/repos"
   git init -q "$TMP/repos/test-repo"
@@ -43,21 +59,25 @@ PASS=1
   printf 'hello\n' > "$TMP/repos/test-repo/README.md"
   git -C "$TMP/repos/test-repo" add README.md
   git -C "$TMP/repos/test-repo" commit -qm "Initial test commit"
+  printf 'working tree change\n' >> "$TMP/repos/test-repo/README.md"
 
   if "$ROOT/git-audit" "$TMP/repos"; then
     echo "PASS"
   else
-    RC=$?
-    echo "NOTE: audit exited $RC because the synthetic repo intentionally has no remote."
-    if [[ "$RC" -eq 1 ]]; then
-      echo "PASS"
-    else
-      echo "FAIL"
-      PASS=0
-    fi
+    echo "FAIL"
+    PASS=0
   fi
 
   rm -rf "$TMP"
+
+  echo
+  echo "== Source guard: reject explicit network/mutation subprocesses =="
+  if grep -En 'run_git\([^)]*"(fetch|push|pull|commit|checkout|reset|merge|rebase|remote[[:space:]]+(add|set-url|remove))"' "$ROOT/git-audit"; then
+    echo "FAIL: mutating/network Git command found"
+    PASS=0
+  else
+    echo "PASS"
+  fi
 
   echo
   echo "== Git status =="

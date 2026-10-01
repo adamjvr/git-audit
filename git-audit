@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
+import os
 import subprocess
 import sys
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 
 SKIP_DIRS = {
@@ -18,7 +19,23 @@ SKIP_DIRS = {
 
 
 def run_git(repo, *args, timeout=15):
-    """Run a git command and return (success, stdout, stderr)."""
+    """
+    Run a Git command in a strictly non-interactive environment.
+
+    This tool is diagnostic only:
+      - no fetch
+      - no pull
+      - no push
+      - no checkout
+      - no commit
+      - no stash
+      - no reset
+      - no remote mutation
+    """
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "Never"
+
     try:
         result = subprocess.run(
             ["git", "-C", str(repo), *args],
@@ -26,6 +43,7 @@ def run_git(repo, *args, timeout=15):
             stderr=subprocess.PIPE,
             text=True,
             timeout=timeout,
+            env=env,
         )
         return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
     except (subprocess.TimeoutExpired, OSError) as exc:
@@ -33,7 +51,13 @@ def run_git(repo, *args, timeout=15):
 
 
 def discover_repos(root):
-    """Find Git repositories beneath root without descending into repos."""
+    """
+    Find Git repositories beneath root.
+
+    Once a repository root is found, do not descend into it. This avoids
+    treating build trees, vendored content, or ordinary nested directories
+    as separate repositories.
+    """
     repos = []
 
     def walk(path):
@@ -79,23 +103,18 @@ def count_porcelain(status_text):
 
         if x not in (" ", "?"):
             staged += 1
+
         if y not in (" ", "?"):
             modified += 1
 
     return staged, modified, untracked, conflicts
 
 
-def repo_info(repo, fetch=False):
-    fetch_error = ""
+def repo_info(repo):
+    ok, branch, _ = run_git(repo, "branch", "--show-current")
+    if not ok:
+        branch = ""
 
-    if fetch:
-        ok, _, fetch_error = run_git(
-            repo, "fetch", "--all", "--prune", "--quiet", timeout=60
-        )
-        if ok:
-            fetch_error = ""
-
-    _, branch, _ = run_git(repo, "branch", "--show-current")
     detached = not branch
 
     if detached:
@@ -118,6 +137,8 @@ def repo_info(repo, fetch=False):
     ahead = None
     behind = None
 
+    # Important: this compares only against the locally cached upstream ref.
+    # It does not contact the network.
     if upstream:
         ok, counts, _ = run_git(
             repo,
@@ -134,6 +155,12 @@ def repo_info(repo, fetch=False):
 
     ok, remotes, _ = run_git(repo, "remote")
     remote_list = remotes.splitlines() if ok and remotes else []
+
+    remote_urls = {}
+    for remote in remote_list:
+        ok, url, _ = run_git(repo, "remote", "get-url", remote)
+        if ok and url:
+            remote_urls[remote] = url
 
     ok, origin_url, _ = run_git(repo, "remote", "get-url", "origin")
     if not ok:
@@ -159,28 +186,41 @@ def repo_info(repo, fetch=False):
         if len(parts) == 3:
             commit_hash, commit_date, commit_subject = parts
 
+    ok, head_sha, _ = run_git(repo, "rev-parse", "HEAD")
+    if not ok:
+        head_sha = ""
+
+    ok, git_dir, _ = run_git(repo, "rev-parse", "--git-dir")
+    if not ok:
+        git_dir = ""
+
     problems = []
 
-    if fetch_error:
-        problems.append("FETCH FAILED")
     if conflicts:
         problems.append("CONFLICTS")
+
     if modified or staged or untracked:
-        problems.append("NEEDS COMMIT")
+        problems.append("UNCOMMITTED WORK")
+
     if not remote_list:
         problems.append("NO REMOTE")
+
     if remote_list and not upstream:
         problems.append("NO UPSTREAM")
-    if ahead and ahead > 0:
-        problems.append("NEEDS PUSH")
-    if behind and behind > 0:
-        problems.append("BEHIND")
+
+    if ahead is not None and ahead > 0:
+        problems.append("LOCAL COMMITS NOT IN CACHED UPSTREAM")
+
+    if behind is not None and behind > 0:
+        problems.append("CACHED UPSTREAM AHEAD")
+
     if detached:
         problems.append("DETACHED")
+
     if stash_count:
         problems.append("STASHED WORK")
 
-    overall = "SAFE" if not problems else " + ".join(problems)
+    overall = "CLEAN LOCAL STATE" if not problems else " + ".join(problems)
 
     return {
         "name": repo.name,
@@ -195,109 +235,126 @@ def repo_info(repo, fetch=False):
         "conflicts": conflicts,
         "stashes": stash_count,
         "remote_count": len(remote_list),
+        "remote_urls": remote_urls,
         "origin": origin_url,
         "commit_hash": commit_hash,
         "commit_date": commit_date,
         "commit_subject": commit_subject,
+        "head_sha": head_sha,
+        "git_dir": git_dir,
         "overall": overall,
-        "fetch_error": fetch_error,
     }
 
 
 def compact_changes(info):
     bits = []
+
     if info["staged"]:
-        bits.append(f"S:{info['staged']}")
+        bits.append(f"staged:{info['staged']}")
     if info["modified"]:
-        bits.append(f"M:{info['modified']}")
+        bits.append(f"modified:{info['modified']}")
     if info["untracked"]:
-        bits.append(f"?:{info['untracked']}")
+        bits.append(f"untracked:{info['untracked']}")
     if info["conflicts"]:
-        bits.append(f"C:{info['conflicts']}")
+        bits.append(f"conflicts:{info['conflicts']}")
     if info["stashes"]:
-        bits.append(f"stash:{info['stashes']}")
-    return " ".join(bits) if bits else "clean"
+        bits.append(f"stashes:{info['stashes']}")
+
+    return ", ".join(bits) if bits else "clean"
 
 
-def compact_sync(info):
+def compact_cached_upstream(info):
     if info["remote_count"] == 0:
-        return "NO REMOTE"
+        return "no remote"
+
     if info["upstream"] == "-":
-        return "NO UPSTREAM"
+        return "no upstream"
 
     ahead = info["ahead"] if info["ahead"] is not None else "?"
     behind = info["behind"] if info["behind"] is not None else "?"
 
     if ahead == 0 and behind == 0:
-        return "synced"
-    return f"+{ahead}/-{behind}"
+        return "matches cached upstream ref"
+
+    return f"local +{ahead} / cached upstream +{behind}"
 
 
 def print_report(results, root):
     print()
     print("=" * 100)
-    print("GIT REPOSITORY AUDIT")
+    print("GIT LOCAL STATE AUDIT")
     print("=" * 100)
     print(f"Root:         {root}")
     print(f"Repositories: {len(results)}")
     print(f"Generated:    {datetime.now().astimezone().isoformat(timespec='seconds')}")
     print()
+    print("NETWORK:      DISABLED BY DESIGN")
+    print("MUTATION:     NONE")
+    print("NOTE:         Upstream comparisons use locally cached remote refs only.")
+    print()
 
-    safe = sum(1 for r in results if r["overall"] == "SAFE")
-    dirty = sum(1 for r in results if r["staged"] or r["modified"] or r["untracked"])
-    unpushed = sum(1 for r in results if r["ahead"] is not None and r["ahead"] > 0)
-    behind = sum(1 for r in results if r["behind"] is not None and r["behind"] > 0)
+    clean = sum(1 for r in results if r["overall"] == "CLEAN LOCAL STATE")
+    dirty = sum(
+        1 for r in results
+        if r["staged"] or r["modified"] or r["untracked"]
+    )
+    local_ahead = sum(
+        1 for r in results
+        if r["ahead"] is not None and r["ahead"] > 0
+    )
+    cached_behind = sum(
+        1 for r in results
+        if r["behind"] is not None and r["behind"] > 0
+    )
     no_remote = sum(1 for r in results if r["remote_count"] == 0)
     no_upstream = sum(
-        1 for r in results if r["remote_count"] > 0 and r["upstream"] == "-"
+        1 for r in results
+        if r["remote_count"] > 0 and r["upstream"] == "-"
     )
     stash_repos = sum(1 for r in results if r["stashes"] > 0)
-    fetch_failed = sum(1 for r in results if r["fetch_error"])
+    detached = sum(1 for r in results if r["branch"].startswith("DETACHED"))
 
     print("SUMMARY")
-    print(f"  SAFE:               {safe}")
-    print(f"  Working tree dirty: {dirty}")
-    print(f"  Unpushed commits:   {unpushed}")
-    print(f"  Behind upstream:    {behind}")
-    print(f"  No remote:          {no_remote}")
-    print(f"  No upstream:        {no_upstream}")
-    print(f"  Repos with stashes: {stash_repos}")
-    print(f"  Fetch failures:     {fetch_failed}")
+    print(f"  Clean local state:           {clean}")
+    print(f"  Repos with uncommitted work: {dirty}")
+    print(f"  Ahead of cached upstream:    {local_ahead}")
+    print(f"  Cached upstream ahead:       {cached_behind}")
+    print(f"  No remote configured:        {no_remote}")
+    print(f"  No upstream configured:      {no_upstream}")
+    print(f"  Repos with stashes:          {stash_repos}")
+    print(f"  Detached HEAD:               {detached}")
     print()
 
     print("-" * 100)
 
     for info in results:
         print(info["name"])
-        print(f"  Status:   {info['overall']}")
-        print(f"  Branch:   {info['branch']}")
-        print(f"  Changes:  {compact_changes(info)}")
-        print(f"  Remote:   {compact_sync(info)}")
+        print(f"  State:     {info['overall']}")
+        print(f"  Branch:    {info['branch']}")
+        print(f"  Changes:   {compact_changes(info)}")
+        print(f"  Upstream:  {compact_cached_upstream(info)}")
 
         if info["upstream"] != "-":
-            print(f"  Tracking: {info['upstream']}")
-
-        print(
-            f"  Latest:   {info['commit_hash']}  "
-            f"{info['commit_date']}  {info['commit_subject']}"
-        )
+            print(f"  Tracking:  {info['upstream']}")
 
         if info["origin"]:
-            print(f"  Origin:   {info['origin']}")
-        if info["fetch_error"]:
-            print(f"  Fetch:    FAILED: {info['fetch_error']}")
+            print(f"  Origin:    {info['origin']}")
 
-        print(f"  Path:     {info['path']}")
+        print(
+            f"  Latest:    {info['commit_hash']}  "
+            f"{info['commit_date']}  {info['commit_subject']}"
+        )
+        print(f"  Path:      {info['path']}")
         print("-" * 100)
 
     print()
-    print("ATTENTION REQUIRED")
+    print("REVIEW QUEUE")
     print()
 
-    trouble = [r for r in results if r["overall"] != "SAFE"]
+    trouble = [r for r in results if r["overall"] != "CLEAN LOCAL STATE"]
 
     if not trouble:
-        print("  All repositories appear committed and synchronized.")
+        print("  No local-state issues detected.")
     else:
         for info in trouble:
             print(f"  {info['name']:<32} {info['overall']}")
@@ -307,13 +364,19 @@ def print_report(results, root):
 
 def write_markdown(results, root, output):
     lines = [
-        "# Git Repository Audit",
+        "# Git Local State Audit",
         "",
         f"Generated: `{datetime.now().astimezone().isoformat(timespec='seconds')}`",
         "",
         f"Root: `{root}`",
         "",
-        "| Repository | State | Branch | Changes | Remote | Latest commit |",
+        "**Network activity:** none  ",
+        "**Repository mutation:** none  ",
+        "",
+        "> Upstream comparisons use locally cached remote refs only. "
+        "This report does not verify current GitHub state.",
+        "",
+        "| Repository | Local state | Branch | Changes | Cached upstream | Latest commit |",
         "|---|---|---|---|---|---|",
     ]
 
@@ -324,13 +387,13 @@ def write_markdown(results, root, output):
             f"| {info['overall']} "
             f"| `{info['branch']}` "
             f"| {compact_changes(info)} "
-            f"| {compact_sync(info)} "
+            f"| {compact_cached_upstream(info)} "
             f"| `{info['commit_hash']}` {subject} |"
         )
 
-    lines.extend(["", "## Attention Required", ""])
+    lines.extend(["", "## Review Queue", ""])
 
-    trouble = [r for r in results if r["overall"] != "SAFE"]
+    trouble = [r for r in results if r["overall"] != "CLEAN LOCAL STATE"]
 
     if trouble:
         for info in trouble:
@@ -338,25 +401,23 @@ def write_markdown(results, root, output):
                 f"- **{info['name']}** — {info['overall']} — `{info['path']}`"
             )
     else:
-        lines.append("All repositories appear committed and synchronized.")
+        lines.append("No local-state issues detected.")
 
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Audit a folder containing Git repositories."
+        description=(
+            "Read-only, offline audit of local Git repository state. "
+            "This command never contacts remotes or changes repositories."
+        )
     )
     parser.add_argument(
         "root",
         nargs="?",
         default="~/GitHub",
         help="Directory containing repositories (default: ~/GitHub)",
-    )
-    parser.add_argument(
-        "--fetch",
-        action="store_true",
-        help="Run git fetch --all --prune before checking each repo.",
     )
     parser.add_argument(
         "--markdown",
@@ -379,9 +440,10 @@ def main():
         return 0
 
     results = []
+
     for repo in repos:
         print(f"Checking {repo.name}...", file=sys.stderr)
-        results.append(repo_info(repo, fetch=args.fetch))
+        results.append(repo_info(repo))
 
     print_report(results, root)
 
@@ -391,7 +453,9 @@ def main():
         write_markdown(results, root, output)
         print(f"Markdown report written to: {output}")
 
-    return 1 if any(r["overall"] != "SAFE" for r in results) else 0
+    # Diagnostic result only. Exit success unless the audit itself failed.
+    # Repository states are information for the user, not command failures.
+    return 0
 
 
 if __name__ == "__main__":
